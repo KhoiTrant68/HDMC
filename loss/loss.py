@@ -1,6 +1,6 @@
-import math
-from typing import List, Tuple, Union
+--- START OF FILE loss.py ---
 
+import math
 import torch
 import torch.nn as nn
 
@@ -62,7 +62,6 @@ class RateDistortionLoss(nn.Module):
 
         # --- 1. RATE LOSS (BPP) ---
         # Calculate bits based on likelihoods for y and z latents
-        # Clamp likelihoods to prevent log(0) -> NaN
         total_bits = 0
         for name, likelihood in output["likelihoods"].items():
             if isinstance(likelihood, (list, tuple)):
@@ -77,41 +76,46 @@ class RateDistortionLoss(nn.Module):
         # --- 2. DISTORTION LOSS ---
         x_hat = output["x_hat"].clamp(0, 1)
 
-        # Initialize dist_loss to prevent UnboundLocalError
+        # Initialize dist_loss
         dist_loss = torch.tensor(0.0, device=target.device)
 
+        # Compute MSE (needed for PSNR regardless of loss_type)
+        mse_val = self.mse(x_hat, target)
+        out["mse_loss"] = mse_val
+
         if self.loss_type == "mse":
-            out["mse_loss"] = self.mse(x_hat, target)
-            # Scale MSE by 255^2 to align magnitude with BPP
-            dist_loss = 255**2 * out["mse_loss"]
+            # Scale MSE by 255^2 to align magnitude with BPP if desired, 
+            # or keep raw. Standard CompressAI uses 255**2 * MSE for lambda tuning.
+            dist_loss = 255**2 * mse_val
 
         elif self.loss_type == "ms_ssim":
             if ms_ssim is None:
                 raise ImportError(
                     "pytorch_msssim not installed. Install it with: pip install pytorch-msssim"
                 )
-            # MS-SSIM is max 1.0, so loss is 1 - MS-SSIM
             out["ms_ssim_loss"] = 1 - ms_ssim(x_hat, target, data_range=1.0)
             dist_loss = out["ms_ssim_loss"]
-
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
         out["dist_loss"] = dist_loss
 
-        # --- 3. MOE MONITORING (Loss-Free Metric) ---
-        # Calculate expert load balance metric for logging/Tensorboard.
-        # This is cgralculated under no_grad to ensure no interference with the main aph.
+        # --- 3. PSNR (Critical Fix) ---
+        # PSNR = -10 * log10(MSE)
+        # Handle case where MSE is 0 to avoid NaN
+        if mse_val > 1e-10:
+            out["psnr"] = -10 * torch.log10(mse_val)
+        else:
+            out["psnr"] = torch.tensor(100.0, device=target.device)
+
+        # --- 4. MOE MONITORING (Loss-Free Metric) ---
         if "router_logits" in output and output["router_logits"] is not None:
             with torch.no_grad():
                 out["moe_imbalance"] = self._calculate_imbalance(
                     output["router_logits"]
                 )
 
-        # --- 4. TOTAL LOSS ---
-        # Total Loss = Rate + Lambda * Distortion
-        # In Loss-Free Balancing, the MoE balance logic is handled by the Balancer,
-        # not by adding a penalty to this sum.
+        # --- 5. TOTAL LOSS ---
         out["loss"] = out["bpp_loss"] + self.lmbda * dist_loss
 
         return out

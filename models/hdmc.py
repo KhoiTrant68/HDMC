@@ -710,7 +710,9 @@ class HDMC(CompressionModel):
             rv = decoder.decode_stream(
                 index.reshape(-1).tolist(), cdf, cdf_lengths, offsets
             )
-            rv = torch.Tensor(rv).reshape(1, -1, y_shape[0], y_shape[1]).to(mu.device)
+            rv = torch.tensor(rv, dtype=torch.float32, device=mu.device).reshape(
+                1, -1, y_shape[0], y_shape[1]
+            )
             y_hat_slice = self.gaussian_conditional.dequantize(rv, mu)
 
             lrp_in = torch.cat([support_feat, y_hat_slice], dim=1)
@@ -734,9 +736,8 @@ class HDMC(CompressionModel):
             index_anc.reshape(-1).tolist(), cdf, cdf_lengths, offsets
         )
         rv_anc = (
-            torch.Tensor(rv_anc)
+            torch.tensor(rv_anc, dtype=torch.float32, device=mu_anc.device)
             .reshape(1, self.last_slice_dim, y_shape[0] // 2, y_shape[1] // 2)
-            .to(mu_anc.device)
         )
         y_hat_anc = self.gaussian_conditional.dequantize(rv_anc, mu_anc)
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
@@ -753,10 +754,10 @@ class HDMC(CompressionModel):
         rv_na = decoder.decode_stream(
             index_na.reshape(-1).tolist(), cdf, cdf_lengths, offsets
         )
+        # OPTIMIZATION
         rv_na = (
-            torch.Tensor(rv_na)
+            torch.tensor(rv_na, dtype=torch.float32, device=mu_na.device)
             .reshape(1, self.last_slice_dim * 3, y_shape[0] // 2, y_shape[1] // 2)
-            .to(mu_na.device)
         )
         y_hat_na = self.gaussian_conditional.dequantize(rv_na, mu_na)
         lrp_na = self.lrp_non_anchor(torch.cat([feat_na, y_hat_na], dim=1))
