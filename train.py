@@ -209,14 +209,18 @@ def train_one_epoch(
 
         optimizer.step()
 
+        # Unwrap model once for both Balancer and Aux Loss
+        # This handles the DistributedDataParallel wrapper
+        unwrapped_model = accelerator.unwrap_model(model)
+
         # 4. LOSS-FREE BALANCING UPDATE
         # Done outside of autograd, after optimizer step
         if "router_logits" in out_net and out_net["router_logits"]:
-            unwrapped = accelerator.unwrap_model(model)
-            balancer.update_biases(unwrapped, out_net["router_logits"], accelerator)
+            balancer.update_biases(unwrapped_model, out_net["router_logits"], accelerator)
 
         # 5. Aux Loss (Entropy Bottleneck CDFs)
-        aux_loss = model.aux_loss()
+        # Fix: Call aux_loss on the unwrapped model
+        aux_loss = unwrapped_model.aux_loss()
         accelerator.backward(aux_loss)
         aux_optimizer.step()
 
@@ -240,9 +244,8 @@ def train_one_epoch(
 
             # Optional: Log bias stats to verify balancing
             if not bias_stats_logged:
-                unwrapped = accelerator.unwrap_model(model)
-                if hasattr(unwrapped.dt_cross_attention[0], "expert_biases"):
-                    biases = unwrapped.dt_cross_attention[0].expert_biases
+                if hasattr(unwrapped_model.dt_cross_attention[0], "expert_biases"):
+                    biases = unwrapped_model.dt_cross_attention[0].expert_biases
                     writer.add_scalar(
                         "Debug/Bias_Max", biases.max().item(), global_step
                     )
