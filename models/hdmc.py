@@ -1,17 +1,17 @@
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 from compressai.models.utils import update_registered_buffers
 
-# Uses the ConvNeXt Blocks defined in your updated modules
 from modules.conv_module import (
     ConvBottleneckBlockWithStride,
     ConvBottleneckBlockWithUpsample,
+    LayerNorm2d,  
 )
 from modules.swin_module import (
     ResScaleConvGateBlock,
@@ -29,13 +29,11 @@ def get_scale_table(min=0.11, max=256, levels=64):
 
 
 # =========================================================================
-#  HELPER MODULES (Spatial Checkerboard & SimpleGate)
+#  HELPER MODULES
 # =========================================================================
 
-
 class SimpleGate(nn.Module):
-    """Splits channels in half and multiplies them. Needed for NAFBlock."""
-
+    """SOTA Activation: Splits channels and multiplies (Swish-like linear variant)."""
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
@@ -43,86 +41,70 @@ class SimpleGate(nn.Module):
 
 class CheckerboardSplitter(nn.Module):
     """
-    Splits a (B, C, H, W) tensor into:
-    1. Anchor: Top-Left pixel of 2x2 block -> (B, C, H/2, W/2)
-    2. Non-Anchor: The other 3 pixels stacked -> (B, 3*C, H/2, W/2)
+    Splits (B, C, H, W) -> Anchor (B, C, H/2, W/2) & Non-Anchor (B, 3C, H/2, W/2)
     """
-
     def forward(self, x):
         B, C, H, W = x.shape
-        # Reshape to isolate 2x2 blocks: (B, C, H/2, 2, W/2, 2)
-        # Permute to (B, C, H/2, W/2, 2, 2) to group spatial dims
+        # View as 2x2 blocks
         x_reshaped = x.view(B, C, H // 2, 2, W // 2, 2).permute(0, 1, 2, 4, 3, 5)
-
-        # Anchor is at local index (0, 0)
-        anchor = x_reshaped[..., 0, 0]  # (B, C, H/2, W/2)
-
-        # Non-Anchors are (0,1), (1,0), (1,1)
+        
+        # Anchor: Top-Left (0,0)
+        anchor = x_reshaped[..., 0, 0]
+        
+        # Non-Anchors: (0,1), (1,0), (1,1)
         na1 = x_reshaped[..., 0, 1]
         na2 = x_reshaped[..., 1, 0]
         na3 = x_reshaped[..., 1, 1]
-
-        # Concatenate neighbors into channels
-        non_anchor = torch.cat([na1, na2, na3], dim=1)  # (B, 3C, H/2, W/2)
+        
+        non_anchor = torch.cat([na1, na2, na3], dim=1)
         return anchor, non_anchor
 
 
 class CheckerboardMerger(nn.Module):
-    """Reverses the split to reconstruction (B, C, H, W)"""
-
+    """
+    Merges Anchor & Non-Anchor back to (B, C, H, W)
+    """
     def forward(self, anchor, non_anchor):
         B, C, H_half, W_half = anchor.shape
-
-        # Split non_anchor back to 3 parts
         na1, na2, na3 = torch.split(non_anchor, C, dim=1)
 
-        # Stack into 2x2 grid: [[Anchor, na1], [na2, na3]]
-        row0 = torch.stack([anchor, na1], dim=-1)  # (..., 2)
-        row1 = torch.stack([na2, na3], dim=-1)  # (..., 2)
-        grid = torch.stack([row0, row1], dim=-2)  # (..., 2, 2)
+        row0 = torch.stack([anchor, na1], dim=-1)
+        row1 = torch.stack([na2, na3], dim=-1)
+        grid = torch.stack([row0, row1], dim=-2)
 
-        # Permute back: (B, C, H/2, 2, W/2, 2)
         x = grid.permute(0, 1, 2, 4, 3, 5)
-
-        # Merge dims: (B, C, H, W)
         x = x.reshape(B, C, H_half * 2, W_half * 2)
         return x
 
 
-class LayerNorm2d(nn.Module):
-    def __init__(self, channels, eps=1e-6):
-        super(LayerNorm2d, self).__init__()
-        self.register_parameter("weight", nn.Parameter(torch.ones(channels)))
-        self.register_parameter("bias", nn.Parameter(torch.zeros(channels)))
-        self.eps = eps
-
-    def forward(self, x):
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        x = self.weight[:, None, None] * x + self.bias[:, None, None]
-        return x
-
-
 class NAFBlock(nn.Module):
+    """
+    Nonlinear Activation Free Block.
+    SOTA for Image Restoration/Context Modeling due to SimpleGate efficiency.
+    """
     def __init__(self, dim, inter_dim=None):
         super().__init__()
         self.dim = inter_dim if inter_dim is not None else dim
         dw_channel = self.dim * 2
         ffn_channel = self.dim * 2
 
+        # Spatially mixing
         self.dwconv = nn.Sequential(
             nn.Conv2d(self.dim, dw_channel, 1),
             nn.Conv2d(dw_channel, dw_channel, 3, 1, padding=1, groups=dw_channel),
         )
+        # Channel attention (Simplified SCA)
         self.sca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Conv2d(dw_channel // 2, dw_channel // 2, 1)
+            nn.AdaptiveAvgPool2d(1), 
+            nn.Conv2d(dw_channel // 2, dw_channel // 2, 1)
         )
+        # Feed Forward Network with SimpleGate
         self.FFN = nn.Sequential(
             nn.Conv2d(self.dim, ffn_channel, 1),
             SimpleGate(),
             nn.Conv2d(ffn_channel // 2, self.dim, 1),
         )
+        
         self.norm1 = LayerNorm2d(self.dim)
         self.norm2 = LayerNorm2d(self.dim)
         self.conv1 = nn.Conv2d(dw_channel // 2, self.dim, 1)
@@ -159,6 +141,10 @@ class NAFBlock(nn.Module):
         return out
 
 
+# =========================================================================
+#  MAIN MODEL: HDMC (High-Fidelity Deep MoE Compression)
+# =========================================================================
+
 class HDMC(CompressionModel):
     def __init__(
         self,
@@ -168,6 +154,7 @@ class HDMC(CompressionModel):
     ):
         super().__init__()
 
+        # SOTA: Head dimensions tuned for efficiency
         if head_dim is None:
             self.head_dim = [8, 16, 32, 32, 16, 8]
         else:
@@ -176,56 +163,43 @@ class HDMC(CompressionModel):
         self.N = N
         self.M = M
 
-        # Uneven Groups: [0, 16, 16, 32, 64, 192]
-        # Slices 0-3 (Scale 1/2) | Slice 4 (Scale 3 HPCM)
+        # Slice Groups: [0, 16, 16, 32, 64, 192]
         self.groups = [0, 16, 16, 32, 64, 192]
         self.num_standard_slices = len(self.groups) - 2
         self.last_slice_dim = self.groups[-1]
 
-        # ==================================================
-        # PART 1: BACKBONE (Updated Window Size=16)
-        # ==================================================
+        # Backbone Config
         self.window_size = 16
         feature_dim = [96, 144, 256]
-        basic_block = ResScaleConvGateBlock
-        swin_block = SwinBlockWithConvMulti
-        block_counts = [1, 2, 12]
+        
+        # Use Optimized Blocks
+        # basic_block = ResScaleConvGateBlock
+        # swin_block = SwinBlockWithConvMulti
+        # block_counts = [1, 2, 12]
 
-        # Encoder
+        # ------------------------------------------------------------------
+        # 1. ENCODER (Analysis Transform)
+        # ------------------------------------------------------------------
         self.m_down1 = nn.Sequential(
-            swin_block(
-                feature_dim[0],
-                feature_dim[0],
-                self.head_dim[0],
-                self.window_size,
-                0,
-                basic_block,
-                block_num=block_counts[0],
-            ),
+            # swin_block(
+            #     feature_dim[0], feature_dim[0], self.head_dim[0], self.window_size,
+            #     0, basic_block, block_num=block_counts[0],
+            # ),
             ConvBottleneckBlockWithStride(feature_dim[0], feature_dim[1]),
         )
         self.m_down2 = nn.Sequential(
-            swin_block(
-                feature_dim[1],
-                feature_dim[1],
-                self.head_dim[1],
-                self.window_size,
-                0,
-                basic_block,
-                block_num=block_counts[1],
-            ),
+            # swin_block(
+            #     feature_dim[1], feature_dim[1], self.head_dim[1], self.window_size,
+            #     0, basic_block, block_num=block_counts[1],
+            # ),
             ConvBottleneckBlockWithStride(feature_dim[1], feature_dim[2]),
         )
         self.m_down3 = nn.Sequential(
-            swin_block(
-                feature_dim[2],
-                feature_dim[2],
-                self.head_dim[2],
-                self.window_size,
-                0,
-                basic_block,
-                block_num=block_counts[2],
-            ),
+            # swin_block(
+            #     feature_dim[2], feature_dim[2], self.head_dim[2], self.window_size,
+            #     0, basic_block, block_num=block_counts[2],
+            # ),
+            # Downsample to Latent Dimension M
             nn.Conv2d(feature_dim[2], M, kernel_size=5, stride=2, padding=2),
         )
         self.g_a = nn.Sequential(
@@ -235,76 +209,59 @@ class HDMC(CompressionModel):
             self.m_down3,
         )
 
-        # Decoder
+        # ------------------------------------------------------------------
+        # 2. DECODER (Synthesis Transform)
+        # ------------------------------------------------------------------
         self.m_up1 = nn.Sequential(
-            swin_block(
-                feature_dim[2],
-                feature_dim[2],
-                self.head_dim[3],
-                self.window_size,
-                0,
-                basic_block,
-                block_num=block_counts[2],
-            ),
+            # swin_block(
+            #     feature_dim[2], feature_dim[2], self.head_dim[3], self.window_size,
+            #     0, basic_block, block_num=block_counts[2],
+            # ),
             ConvBottleneckBlockWithUpsample(feature_dim[2], feature_dim[1]),
         )
         self.m_up2 = nn.Sequential(
-            swin_block(
-                feature_dim[1],
-                feature_dim[1],
-                self.head_dim[4],
-                self.window_size,
-                0,
-                basic_block,
-                block_num=block_counts[1],
-            ),
+            # swin_block(
+            #     feature_dim[1], feature_dim[1], self.head_dim[4], self.window_size,
+            #     0, basic_block, block_num=block_counts[1],
+            # ),
             ConvBottleneckBlockWithUpsample(feature_dim[1], feature_dim[0]),
         )
         self.m_up3 = nn.Sequential(
-            swin_block(
-                feature_dim[0],
-                feature_dim[0],
-                self.head_dim[5],
-                self.window_size,
-                0,
-                basic_block,
-                block_num=block_counts[0],
-            ),
+            # swin_block(
+            #     feature_dim[0], feature_dim[0], self.head_dim[5], self.window_size,
+            #     0, basic_block, block_num=block_counts[0],
+            # ),
             ConvBottleneckBlockWithUpsample(feature_dim[0], 3),
         )
         self.g_s = nn.Sequential(
-            nn.ConvTranspose2d(
-                M, feature_dim[2], kernel_size=5, stride=2, output_padding=1, padding=2
-            ),
+            nn.ConvTranspose2d(M, feature_dim[2], 5, 2, padding=2, output_padding=1),
             self.m_up1,
             self.m_up2,
             self.m_up3,
         )
 
-        # Hyper-Prior
+        # ------------------------------------------------------------------
+        # 3. HYPER-PRIOR
+        # ------------------------------------------------------------------
         self.h_a = nn.Sequential(
             ConvBottleneckBlockWithStride(M, N),
             SwinBlockWithConvMulti(N, N, 32, 4, 0, ResScaleConvGateBlock, block_num=1),
-            nn.Conv2d(N, 192, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(N, 192, 3, 2, 1),
         )
         self.h_z_s1 = nn.Sequential(
-            nn.ConvTranspose2d(
-                192, N, kernel_size=3, stride=2, output_padding=1, padding=1
-            ),
+            nn.ConvTranspose2d(192, N, 3, 2, padding=1, output_padding=1),
             SwinBlockWithConvMulti(N, N, 32, 4, 0, ResScaleConvGateBlock, block_num=1),
             ConvBottleneckBlockWithUpsample(N, M),
         )
         self.h_z_s2 = nn.Sequential(
-            nn.ConvTranspose2d(
-                192, N, kernel_size=3, stride=2, output_padding=1, padding=1
-            ),
+            nn.ConvTranspose2d(192, N, 3, 2, padding=1, output_padding=1),
             SwinBlockWithConvMulti(N, N, 32, 4, 0, ResScaleConvGateBlock, block_num=1),
             ConvBottleneckBlockWithUpsample(N, M),
         )
 
-        # ==================================================
-        # PART 2: ENTROPY MODULES
-        # ==================================================
+        # ------------------------------------------------------------------
+        # 4. ENTROPY PARAMETERS & CONTEXT
+        # ------------------------------------------------------------------
         self.dt_cross_attention = nn.ModuleList()
         self.context_transforms = nn.ModuleList()
         self.mean_transforms = nn.ModuleList()
@@ -313,7 +270,7 @@ class HDMC(CompressionModel):
 
         cum_channels = 0
 
-        # --- A. Standard Slices (Scale 1 & 2) ---
+        # --- A. Standard Slices ---
         for i in range(self.num_standard_slices):
             current_dim = self.groups[i + 1]
             moe_input_dim = (M * 2) + cum_channels
@@ -323,7 +280,8 @@ class HDMC(CompressionModel):
                     input_dim=moe_input_dim,
                     output_dim=M,
                     head_num=8,
-                    mlp_rate=4,
+                    # OPTIMIZATION: Reduced mlp_rate from 4.0 -> 2.0 for parameter efficiency
+                    mlp_rate=2.0,
                     num_experts=4,
                 )
             )
@@ -353,16 +311,16 @@ class HDMC(CompressionModel):
             )
             cum_channels += current_dim
 
-        # --- B. Checkerboard Split (Scale 3) ---
+        # --- B. Checkerboard Split (Last Slice) ---
         self.checkerboard_split = CheckerboardSplitter()
         self.checkerboard_merge = CheckerboardMerger()
 
-        # 1. Anchor Modules
+        # 1. Anchor (MoE + NAF)
         self.moe_anchor = SpectralMoEDictionaryCrossAttention(
             input_dim=(M * 2) + cum_channels,
             output_dim=M,
-            head_num=8,
-            mlp_rate=4,
+            head_num=4,
+            mlp_rate=2.0, # Optimization
             num_experts=4,
         )
         support_dim_anc = M + (M * 2) + cum_channels
@@ -384,14 +342,14 @@ class HDMC(CompressionModel):
             nn.Conv2d(224, self.last_slice_dim, 3, 1, 1),
         )
 
-        # 2. Non-Anchor Modules (FUSION)
+        # 2. Non-Anchor (Fusion)
         fusion_input_dim = (M * 2) + cum_channels + self.last_slice_dim
 
         self.moe_non_anchor = SpectralMoEDictionaryCrossAttention(
             input_dim=fusion_input_dim,
             output_dim=M,
-            head_num=8,
-            mlp_rate=4,
+            head_num=4,
+            mlp_rate=2.0, # Optimization
             num_experts=4,
         )
         support_dim_na = M + fusion_input_dim
@@ -436,11 +394,12 @@ class HDMC(CompressionModel):
         z_offset = self.entropy_bottleneck._get_medians()
         z_hat = ste_round(z - z_offset) + z_offset
 
+        # 3. Hyper-Synthesis
         latent_scales = self.h_z_s1(z_hat)
         latent_means = self.h_z_s2(z_hat)
         hyper_info = torch.cat([latent_means, latent_scales], dim=1)
 
-        # 3. Entropy Modeling
+        # 4. Contextual Entropy Modeling
         y_slices = y.split(self.groups[1:], 1)
         y_hat_slices = []
         y_likelihood = []
@@ -448,7 +407,7 @@ class HDMC(CompressionModel):
         scale_list = []
         all_logits = []
 
-        # --- A. Standard Slices (0 to 3) ---
+        # --- A. Standard Slices ---
         for i in range(self.num_standard_slices):
             y_slice = y_slices[i]
             if i == 0:
@@ -458,13 +417,13 @@ class HDMC(CompressionModel):
                 query = torch.cat([hyper_info, prev_slices], dim=1)
 
             dict_info = self.dt_cross_attention[i](query)
+            
+            # Safe access to logits (if available in optimized module)
             if hasattr(self.dt_cross_attention[i], "last_routing_logits"):
-                all_logits.append(
-                    (
-                        self.dt_cross_attention[i].last_routing_logits,
-                        self.dt_cross_attention[i].last_routing_indices,
-                    )
-                )
+                all_logits.append((
+                    self.dt_cross_attention[i].last_routing_logits,
+                    self.dt_cross_attention[i].last_routing_indices
+                ))
 
             support = torch.cat([dict_info, query], dim=1)
             support_feat = self.context_transforms[i](support)
@@ -491,26 +450,23 @@ class HDMC(CompressionModel):
             mu_list.append(mu)
             scale_list.append(scale)
 
-        # --- B. Checkerboard (Slice 4) ---
+        # --- B. Checkerboard (Last Slice) ---
         last_slice = y_slices[-1]
         y_anchor, y_non_anchor = self.checkerboard_split(last_slice)
 
-        # Prepare Context (Downsampled for Anchor)
         prev_slices_full = torch.cat(y_hat_slices, dim=1)
         prev_slices_down = F.avg_pool2d(prev_slices_full, 2)
         hyper_down = F.avg_pool2d(hyper_info, 2)
 
-        # --- Anchor Pass ---
+        # Anchor
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
         dict_info_anc = self.moe_anchor(query_anc)
 
         if hasattr(self.moe_anchor, "last_routing_logits"):
-            all_logits.append(
-                (
-                    self.moe_anchor.last_routing_logits,
-                    self.moe_anchor.last_routing_indices,
-                )
-            )
+            all_logits.append((
+                self.moe_anchor.last_routing_logits,
+                self.moe_anchor.last_routing_indices
+            ))
 
         support_anc = torch.cat([dict_info_anc, query_anc], dim=1)
         feat_anc = self.naf_anchor(support_anc)
@@ -527,17 +483,15 @@ class HDMC(CompressionModel):
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
-        # --- Non-Anchor Pass (FUSION of Global + Local Anchor) ---
-        query_na = torch.cat([query_anc, y_hat_anc], dim=1)  # Cross-Scale Fusion
+        # Non-Anchor
+        query_na = torch.cat([query_anc, y_hat_anc], dim=1)
         dict_info_na = self.moe_non_anchor(query_na)
 
         if hasattr(self.moe_non_anchor, "last_routing_logits"):
-            all_logits.append(
-                (
-                    self.moe_non_anchor.last_routing_logits,
-                    self.moe_non_anchor.last_routing_indices,
-                )
-            )
+            all_logits.append((
+                self.moe_non_anchor.last_routing_logits,
+                self.moe_non_anchor.last_routing_indices
+            ))
 
         support_na = torch.cat([dict_info_na, query_na], dim=1)
         feat_na = self.naf_non_anchor(support_na)
@@ -554,7 +508,7 @@ class HDMC(CompressionModel):
         lrp_na = self.lrp_non_anchor(torch.cat([feat_na, y_hat_na], dim=1))
         y_hat_na = y_hat_na + (0.5 * torch.tanh(lrp_na))
 
-        # --- Merge & Restore ---
+        # Merge
         y_hat_last = self.checkerboard_merge(y_hat_anc, y_hat_na)
         mu_last = self.checkerboard_merge(mu_anc, mu_na)
         scale_last = self.checkerboard_merge(scale_anc, scale_na)
@@ -565,7 +519,7 @@ class HDMC(CompressionModel):
         mu_list.append(mu_last)
         scale_list.append(scale_last)
 
-        # 4. Reconstruction
+        # 5. Synthesis
         y_hat = torch.cat(y_hat_slices, dim=1)
         means = torch.cat(mu_list, dim=1)
         scales = torch.cat(scale_list, dim=1)
@@ -631,7 +585,7 @@ class HDMC(CompressionModel):
             y_hat_slice = y_hat_slice + (0.5 * torch.tanh(lrp))
             y_hat_slices.append(y_hat_slice)
 
-        # B. Checkerboard Slice
+        # B. Checkerboard
         last_slice = y_slices[-1]
         y_anc, y_na = self.checkerboard_split(last_slice)
         prev_slices_down = F.avg_pool2d(torch.cat(y_hat_slices, dim=1), 2)
@@ -720,7 +674,7 @@ class HDMC(CompressionModel):
             y_hat_slice = y_hat_slice + (0.5 * torch.tanh(lrp))
             y_hat_slices.append(y_hat_slice)
 
-        # B. Checkerboard Slice
+        # B. Checkerboard
         prev_slices_down = F.avg_pool2d(torch.cat(y_hat_slices, dim=1), 2)
         hyper_down = F.avg_pool2d(hyper_info, 2)
 
@@ -754,7 +708,6 @@ class HDMC(CompressionModel):
         rv_na = decoder.decode_stream(
             index_na.reshape(-1).tolist(), cdf, cdf_lengths, offsets
         )
-        # OPTIMIZATION
         rv_na = (
             torch.tensor(rv_na, dtype=torch.float32, device=mu_na.device)
             .reshape(1, self.last_slice_dim * 3, y_shape[0] // 2, y_shape[1] // 2)
@@ -763,7 +716,6 @@ class HDMC(CompressionModel):
         lrp_na = self.lrp_non_anchor(torch.cat([feat_na, y_hat_na], dim=1))
         y_hat_na = y_hat_na + (0.5 * torch.tanh(lrp_na))
 
-        # Merge
         y_hat_last = self.checkerboard_merge(y_hat_anc, y_hat_na)
         y_hat_slices.append(y_hat_last)
 
@@ -783,8 +735,8 @@ class HDMC(CompressionModel):
     @classmethod
     def from_state_dict(cls, state_dict):
         try:
-            N = state_dict["g_a.0.weight"].size(0)
-            M = state_dict["g_a.6.weight"].size(0)
+            N = state_dict["g_a.0.downsample.1.weight"].size(0) # Checked against new ConvModule structure
+            M = state_dict["g_a.3.1.weight"].size(0)
         except KeyError:
             N = 192
             M = 320
